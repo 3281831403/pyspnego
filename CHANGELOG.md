@@ -2,6 +2,10 @@
 
 ## 0.13.0 - TBD
 
+* Make NTLM receive-side operations (`unwrap`, `unwrap_iov`, `unwrap_winrm`, and `verify`) transactional
+  * A forged message that fails the MIC check no longer consumes the RC4 keystream position or the sequence number, so a single injected packet can no longer cause every subsequent valid message on the authenticated connection to be rejected
+  * The incoming RC4 handle and sequence counters are snapshotted before the operation and restored when it fails; the rejected message still raises `BadMICError` as before and successful message bytes are unchanged
+
 ## 0.12.4 - 2026-10-06
 
 * Fix SSPI acceptor with explicit `Password` or `KerberosKeytab` credentials failing with `SEC_E_LOGON_DENIED` when the username is in the UPN form `user@REALM`

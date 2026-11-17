@@ -1004,3 +1004,136 @@ def test_ntlm_iov_unwrapping_as_stream(ntlm_cred):
     assert res4.qop == 0
     assert len(res4.buffers) == 2
     assert res4.buffers[1].data == b"data"
+
+
+def _ntlm_transaction_context(ntlm_cred, lm_compat_level, monkeypatch, wrapped=False):
+    """Build an authenticated initiator/acceptor pair for the transactional receive tests."""
+    if lm_compat_level is not None:
+        monkeypatch.setenv("LM_COMPAT_LEVEL", str(lm_compat_level))
+
+    client_opt = spnego.NegotiateOptions.use_negotiate if wrapped else spnego.NegotiateOptions.use_ntlm
+    server_opt = spnego.NegotiateOptions.use_negotiate if wrapped else spnego.NegotiateOptions.use_ntlm
+
+    c = spnego.client(ntlm_cred[0], ntlm_cred[1], hostname=socket.gethostname(), options=client_opt)
+    s = spnego.server(options=server_opt)
+
+    # SPNEGO wrapped contexts require the full mechListMIC exchange before both sides are complete.
+    token = c.step()
+    while not (c.complete and s.complete):
+        token = s.step(token)
+        if s.complete and token is None:
+            break
+        token = c.step(token)
+
+    return c, s
+
+
+@pytest.mark.parametrize("lm_compat_level", [None, 0])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_ntlm_unwrap_bad_mic_is_transactional(ntlm_cred, monkeypatch, lm_compat_level, wrapped):
+    # A forged message must be rejected with BadMICError but must not consume the RC4 keystream position or sequence
+    # number, otherwise every subsequent valid message on the connection would fail as well.
+    c, s = _ntlm_transaction_context(ntlm_cred, lm_compat_level, monkeypatch, wrapped=wrapped)
+
+    plaintext = b"legitimate message after the forged one"
+    valid_msg = c.wrap(plaintext).data
+
+    forged = bytearray(valid_msg)
+    forged[-1] ^= 0xFF  # tamper with the sealed payload, the MIC will no longer match
+
+    with pytest.raises(BadMICError, match="Invalid Message integrity Check"):
+        s.unwrap(bytes(forged))
+
+    # The failed message left no trace; the next valid message verifies and decrypts normally.
+    result = s.unwrap(valid_msg)
+    assert result.data == plaintext
+
+    # Repeated failures must keep the context usable and the sequence/stream state must only advance on success.
+    for idx in range(3):
+        next_msg = c.wrap(b"message %d" % idx).data
+        bad_msg = bytearray(next_msg)
+        bad_msg[0] = 0x02  # corrupt the signature version byte
+        with pytest.raises(BadMICError, match="Invalid Message integrity Check"):
+            s.unwrap(bytes(bad_msg))
+
+        assert s.unwrap(next_msg).data == b"message %d" % idx
+
+
+@pytest.mark.parametrize("lm_compat_level", [None, 0])
+def test_ntlm_unwrap_winrm_bad_mic_is_transactional(ntlm_cred, monkeypatch, lm_compat_level):
+    c, s = _ntlm_transaction_context(ntlm_cred, lm_compat_level, monkeypatch)
+
+    plaintext = b"winrm payload"
+    wrapped = c.wrap_winrm(plaintext)
+
+    bad_header = bytearray(wrapped.header)
+    bad_header[-1] ^= 0xAA
+
+    with pytest.raises(BadMICError, match="Invalid Message integrity Check"):
+        s.unwrap_winrm(bytes(bad_header), wrapped.data)
+
+    assert s.unwrap_winrm(wrapped.header, wrapped.data) == plaintext
+
+
+@pytest.mark.parametrize("lm_compat_level", [None, 0])
+def test_ntlm_unwrap_iov_bad_mic_is_transactional(ntlm_cred, monkeypatch, lm_compat_level):
+    c, s = _ntlm_transaction_context(ntlm_cred, lm_compat_level, monkeypatch)
+
+    wrap_res = c.wrap_iov(
+        [
+            (spnego.iov.BufferType.sign_only, b"sign 1"),
+            b"sealed data",
+            (spnego.iov.BufferType.data_readonly, b"sign 2"),
+            spnego.iov.BufferType.header,
+        ]
+    )
+
+    forged_data = bytearray(wrap_res.buffers[1].data or b"")
+    forged_data[0] ^= 0x01
+    bad_buffers = [
+        (spnego.iov.BufferType.sign_only, b"sign 1"),
+        (spnego.iov.BufferType.data, bytes(forged_data)),
+        (spnego.iov.BufferType.data_readonly, b"sign 2"),
+        (spnego.iov.BufferType.header, wrap_res.buffers[3].data),
+    ]
+
+    with pytest.raises(BadMICError, match="Invalid Message integrity Check"):
+        s.unwrap_iov(bad_buffers)
+
+    result = s.unwrap_iov(wrap_res.buffers)
+    assert result.buffers[1].data == b"sealed data"
+
+    # Also cover the stream + data IOV form which delegates to unwrap.
+    plaintext = b"stream based iov payload"
+    stream_msg = c.wrap(plaintext).data
+    forged = bytearray(stream_msg)
+    forged[20] ^= 0x5C
+
+    with pytest.raises(BadMICError, match="Invalid Message integrity Check"):
+        s.unwrap_iov([(spnego.iov.BufferType.stream, bytes(forged)), spnego.iov.BufferType.data])
+
+    stream_res = s.unwrap_iov([(spnego.iov.BufferType.stream, stream_msg), spnego.iov.BufferType.data])
+    assert stream_res.buffers[1].data == plaintext
+
+
+@pytest.mark.parametrize("lm_compat_level", [None, 0])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_ntlm_verify_bad_mic_is_transactional(ntlm_cred, monkeypatch, lm_compat_level, wrapped):
+    c, s = _ntlm_transaction_context(ntlm_cred, lm_compat_level, monkeypatch, wrapped=wrapped)
+
+    plaintext = b"signed data"
+    signature = c.sign(plaintext)
+
+    # A signature over different data is rejected without burning the sequence number.
+    with pytest.raises(BadMICError, match="Invalid Message integrity Check"):
+        s.verify(b"forged data", signature)
+
+    assert s.verify(plaintext, signature) == 0
+
+    # Multiple rejections followed by the genuine message must all behave consistently.
+    for idx in range(3):
+        good_sig = c.sign(b"msg %d" % idx)
+        with pytest.raises(BadMICError, match="Invalid Message integrity Check"):
+            s.verify(b"not msg %d" % idx, good_sig)
+
+        assert s.verify(b"msg %d" % idx, good_sig) == 0

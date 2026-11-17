@@ -50,6 +50,7 @@ class RC4Handle:
 
     def __init__(self, key: bytes) -> None:
         self._key = key
+        self._offset = 0
 
         arc4 = algorithms.ARC4(self._key)
         cipher = Cipher(arc4, mode=None, backend=default_backend())
@@ -57,6 +58,7 @@ class RC4Handle:
 
     def update(self, b_data: bytes) -> bytes:
         """Update the RC4 stream and return the encrypted/decrypted bytes."""
+        self._offset += len(b_data)
         return self._handle.update(b_data)
 
     def reset(self) -> None:
@@ -64,6 +66,29 @@ class RC4Handle:
         arc4 = algorithms.ARC4(self._key)
         cipher = Cipher(arc4, mode=None, backend=default_backend())
         self._handle = cipher.encryptor()
+        self._offset = 0
+
+    def checkpoint(self) -> int:
+        """Get the current RC4 stream position.
+
+        The returned value represents how many bytes of the RC4 keystream have been consumed. It can be passed to
+        :meth:`rollback` to restore the stream to this position. This is used to make message verification
+        transactional so a failed MIC check does not consume keystream bytes that a subsequent valid message still
+        relies on.
+        """
+        return self._offset
+
+    def rollback(self, offset: int) -> None:
+        """Restore the RC4 stream to a previous position from :meth:`checkpoint`.
+
+        RC4 is a stream cipher with no per-block state, so advancing a fresh cipher to the same position reproduces
+        the exact same internal state. The stream is reset and advanced by processing the number of zero bytes
+        required to reach ``offset``.
+        """
+        self.reset()
+        if offset:
+            self._handle.update(b"\x00" * offset)
+            self._offset = offset
 
 
 def is_ntlm_hash(password: str) -> bool:

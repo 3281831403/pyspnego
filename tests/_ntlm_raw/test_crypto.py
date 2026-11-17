@@ -282,3 +282,36 @@ def test_signkey_server():
     actual = crypto.signkey(NegotiateFlags.extended_session_security, TEST_RANDOM_SESSION_KEY, "accept")
 
     assert actual == b"\xd0\x4d\x6f\x10\x74\x10\x41\xd1\xd2\x46\xd6\x41\x88\xd7\xa8\xad"
+
+
+def test_rc4_handle_checkpoint_rollback():
+    key = os.urandom(16)
+    handle = crypto.rc4init(key)
+
+    handle.update(b"\x00" * 10)
+    checkpoint = handle.checkpoint()
+    assert checkpoint == 10
+
+    # The bytes consumed after the checkpoint are discarded by a rollback.
+    handle.update(os.urandom(23))
+    assert handle.checkpoint() == 33
+
+    handle.rollback(checkpoint)
+    assert handle.checkpoint() == 10
+
+    # A fresh handle advanced to the same position must produce the same keystream as the rolled back handle.
+    fresh = crypto.rc4init(key)
+    fresh.update(b"\x00" * 10)
+    data = os.urandom(42)
+
+    assert handle.update(data) == fresh.update(data)
+    assert handle.checkpoint() == 52
+
+
+def test_rc4_handle_rollback_to_start():
+    handle = crypto.rc4init(os.urandom(16))
+    original = handle.update(b"\x00" * 16)
+
+    handle.rollback(0)
+    assert handle.checkpoint() == 0
+    assert handle.update(b"\x00" * 16) == original

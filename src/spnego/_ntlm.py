@@ -2,6 +2,7 @@
 # MIT License (see LICENSE or https://opensource.org/licenses/MIT)
 
 import base64
+import contextlib
 import logging
 import os
 import socket
@@ -747,9 +748,10 @@ class NTLMProxy(ContextProxy):
         if not self._handle_in:
             raise NoContextError(context_msg="Cannot unwrap until context has been established")
 
-        signature = data[:16]
-        msg = self._handle_in.update(data[16:])
-        self.verify(msg, signature)
+        with self._recv_transaction():
+            signature = data[:16]
+            msg = self._handle_in.update(data[16:])
+            self.verify(msg, signature)
 
         return UnwrapResult(data=msg, encrypted=True, qop=0)
 
@@ -828,11 +830,12 @@ class NTLMProxy(ContextProxy):
         if data_idx == -1:
             raise InvalidTokenError(context_msg="unwrap_iov no IOV data buffer present")
 
-        dec = self._handle_in.update(res[data_idx].data or b"")
-        res[data_idx] = IOVResBuffer(BufferType.data, dec)
-        signature_input[data_sig_idx] = dec
+        with self._recv_transaction():
+            dec = self._handle_in.update(res[data_idx].data or b"")
+            res[data_idx] = IOVResBuffer(BufferType.data, dec)
+            signature_input[data_sig_idx] = dec
 
-        self.verify(b"".join(signature_input), res[header_idx].data or b"")
+            self.verify(b"".join(signature_input), res[header_idx].data or b"")
 
         return IOVUnwrapResult(tuple(res), encrypted=True, qop=0)
 
@@ -840,8 +843,9 @@ class NTLMProxy(ContextProxy):
         if not self._handle_in:
             raise NoContextError(context_msg="Cannot unwrap until context has been established")
 
-        msg = self._handle_in.update(data)
-        self.verify(msg, header)
+        with self._recv_transaction():
+            msg = self._handle_in.update(data)
+            self.verify(msg, header)
 
         return msg
 
@@ -864,16 +868,17 @@ class NTLMProxy(ContextProxy):
         if not self._handle_in or self._sign_key_in is None:
             raise NoContextError(context_msg="Cannot verify until context has been established")
 
-        expected_sig = sign(
-            self._context_attr,
-            self._handle_in,
-            self._sign_key_in,
-            self._seq_num_in,
-            data,
-        )
+        with self._recv_transaction():
+            expected_sig = sign(
+                self._context_attr,
+                self._handle_in,
+                self._sign_key_in,
+                self._seq_num_in,
+                data,
+            )
 
-        if expected_sig != mic:
-            raise BadMICError(context_msg="Invalid Message integrity Check (MIC) detected")
+            if expected_sig != mic:
+                raise BadMICError(context_msg="Invalid Message integrity Check (MIC) detected")
 
         return 0
 
@@ -914,6 +919,34 @@ class NTLMProxy(ContextProxy):
         num = self.__seq_num_out
         self.__seq_num_out += 1
         return num
+
+    def _snapshot_seq_nums(self) -> typing.Tuple[int, int]:
+        return self.__seq_num_in, self.__seq_num_out
+
+    def _restore_seq_nums(self, snapshot: typing.Tuple[int, int]) -> None:
+        self.__seq_num_in, self.__seq_num_out = snapshot
+
+    @contextlib.contextmanager
+    def _recv_transaction(self) -> typing.Iterator[None]:
+        """Make a receive-side crypto operation transactional.
+
+        NTLM only provides message level integrity over a long-lived connection, so a peer is free to inject a
+        forged message at any point. The RC4 keystream position (and, for signatures, the sequence number) must only
+        advance when the message passes its MIC check. This snapshots the incoming RC4 handle and both sequence
+        counters before the operation and restores them if anything fails, ensuring a rejected message (for example
+        a :class:`BadMICError`) cannot poison the state a subsequent valid message depends on.
+        """
+        handle = typing.cast(RC4Handle, self._handle_in)
+        handle_state = handle.checkpoint()
+        seq_state = self._snapshot_seq_nums()
+
+        try:
+            yield
+
+        except Exception:
+            handle.rollback(handle_state)
+            self._restore_seq_nums(seq_state)
+            raise
 
     def _calculate_mic(
         self,
