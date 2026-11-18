@@ -35,6 +35,7 @@ from spnego.exceptions import (
     InvalidTokenError,
     NegotiateOptions,
     NoContextError,
+    SpnegoError,
 )
 
 log = logging.getLogger(__name__)
@@ -86,6 +87,8 @@ class NegotiateProxy(ContextProxy):
         self._mic_recv = False
         # DCE will always send a MIC token, even for Kerberos.
         self._mic_required = bool(self.context_req & ContextReq.dce_style)
+        # Set when the initiator restarts the selected mechanism after a request-mic reply without a responseToken.
+        self._mech_restart = False
 
     @classmethod
     def available_protocols(cls, options: typing.Optional[NegotiateOptions] = None) -> typing.List[str]:
@@ -156,8 +159,9 @@ class NegotiateProxy(ContextProxy):
         )
 
         mech_token_out = None
-        if mech_token_in or self.usage == "initiate":
+        if mech_token_in or self.usage == "initiate" or self._mech_restart:
             # Step 2. Process the inner context tokens.
+            self._mech_restart = False
             mech_token_out = self._step_spnego_token(in_token=mech_token_in, channel_bindings=channel_bindings)
 
         out_token: typing.Optional[bytes] = None
@@ -192,12 +196,20 @@ class NegotiateProxy(ContextProxy):
         if in_token:
             try:
                 in_token = unpack_token(in_token)
-            except struct.error as e:
+            except (struct.error, ValueError, IndexError) as e:
+                # ASN.1/mechanism parsing failures can surface as struct.error, ValueError or IndexError depending on
+                # where the malformed data is detected. None of these raw types should reach the caller; they all
+                # describe a defective peer token.
                 raise InvalidTokenError(base_error=e, context_msg=f"Failed to unpack input token {e!s}")
 
             if isinstance(in_token, NegTokenInit):
                 mech_list_mic = in_token.mech_list_mic
                 token = in_token.mech_token
+
+                if not in_token.mech_types:
+                    raise InvalidTokenError(
+                        context_msg="SPNEGO NegTokenInit did not contain any mechanisms in mechTypes"
+                    )
 
                 # This is the first token of the exchange, we should build our context list based on the mechs the
                 # opposite end supports.
@@ -221,17 +233,39 @@ class NegotiateProxy(ContextProxy):
                     # of the same mech like the MS Kerberos OID. Reply with the first OID the initiator used for the
                     # chosen mech.
                     chosen_mech = self._chosen_mech
-                    self._supported_mech = next(
-                        oid for oid in in_token.mech_types if self._is_same_mech(chosen_mech, oid)
-                    )
+                    try:
+                        self._supported_mech = next(
+                            oid for oid in in_token.mech_types if self._is_same_mech(chosen_mech, oid)
+                        )
+                    except StopIteration as e:
+                        raise InvalidTokenError(
+                            context_msg="SPNEGO selected mech %s was not offered in the NegTokenInit mechTypes"
+                            % chosen_mech.common_name
+                        ) from e
 
-                    # If the preferred initiator token does not match the preferred acceptor token then the acceptor
-                    # must send the request-mic negState.
-                    preferred_mech = self._preferred_mech_list()[0]
-                    if not self._is_same_mech(preferred_mech, in_token.mech_types[0]):
+                    # If the mechanism the acceptor actually selected is not the initiator's preferred mechanism the
+                    # acceptor must send the request-mic negState. The preferred list is derived from the contexts
+                    # that were successfully created rather than what was reported as available, as a mechanism can
+                    # fail to initialize (for example Kerberos without a KDC or keytab).
+                    if not self._is_same_mech(chosen_mech, in_token.mech_types[0]):
                         self._mic_required = True
 
+                    # RFC 4178: the optimistic mechToken only belongs to the initiator's most preferred mechanism.
+                    # When the acceptor selects a different mechanism the token cannot be interpreted by it and MUST
+                    # be discarded, otherwise a Kerberos ticket may end up being fed to an NTLM context. The acceptor
+                    # replies with request-mic and no responseToken so the initiator restarts the selected mechanism.
+                    if token and not self._is_same_mech(chosen_mech, in_token.mech_types[0]):
+                        log.debug(
+                            "Ignoring SPNEGO optimistic mechToken as the selected mech %s does not match the "
+                            "initiator's preferred mech %s",
+                            chosen_mech.common_name,
+                            in_token.mech_types[0],
+                        )
+                        token = None
+
             elif isinstance(in_token, NegTokenResp):
+                self._validate_neg_token_resp(in_token)
+
                 mech_list_mic = in_token.mech_list_mic
                 token = in_token.response_token
 
@@ -244,10 +278,16 @@ class NegotiateProxy(ContextProxy):
                 # If we have received the supported_mech then we don't need to send our own.
                 if in_token.supported_mech:
                     supported_mech = in_token.supported_mech
-                    self.__chosen_mech = next(
-                        (m for m in self._context_list if self._is_same_mech(m, supported_mech)),
-                        GSSMech.from_oid(supported_mech),
-                    )
+                    try:
+                        self.__chosen_mech = next(
+                            (m for m in self._context_list if self._is_same_mech(m, supported_mech)),
+                            GSSMech.from_oid(supported_mech),
+                        )
+                    except ValueError as e:
+                        raise InvalidTokenError(
+                            base_error=e,
+                            context_msg="SPNEGO supportedMech %s is not a known mechanism" % supported_mech,
+                        ) from e
                     self._mech_sent = True
 
                 # Raise exception if we are rejected and have no error info (mechToken) that will give us more info.
@@ -256,8 +296,28 @@ class NegotiateProxy(ContextProxy):
 
                 if in_token.neg_state == NegState.request_mic:
                     self._mic_required = True
-                elif in_token.neg_state == NegState.accept_complete:
-                    self._complete = True
+
+                    # RFC 4178: when the acceptor did not accept the initiator's preferred mechanism it replies with
+                    # request-mic, supportedMech and no responseToken. The optimistic token was for a different
+                    # mechanism so the initiator must start a fresh context establishment with the selected mechanism
+                    # by invoking its GSS_Init_sec_context() without an input token.
+                    if not token and in_token.supported_mech and self.__chosen_mech:
+                        chosen_context = self._context_list.get(self.__chosen_mech)
+                        if chosen_context is not None:
+                            context, _ = chosen_context
+                            fresh_context = context.new_context()
+                            self._context_list[self.__chosen_mech] = (fresh_context, None)
+                            self._mech_restart = True
+                            log.debug(
+                                "Restarting SPNEGO mechanism context for %s after request-mic",
+                                self.__chosen_mech.common_name,
+                            )
+
+                # Note: the peer's negState is deliberately not used to set the local completion state. Whether the
+                # negotiation is complete is decided solely by the local mechanism context and the state of the
+                # mechListMIC exchange, see _step_spnego_mic() and _step_spnego_output(). A peer claiming
+                # accept-complete while the mechanism context or MIC verification is not finished must not be able to
+                # forge a completed context.
 
             else:
                 # This usually indicates the token is a raw NTLM or Kerberos token, return as is.
@@ -279,6 +339,32 @@ class NegotiateProxy(ContextProxy):
 
         return token, mech_list_mic, is_spnego
 
+    def _validate_neg_token_resp(self, token: NegTokenResp) -> None:
+        """Validates a NegTokenResp against the RFC 4178 state machine for the local usage."""
+        if self.usage == "accept":
+            # The request-mic and reject states are restricted to the target's first reply. An acceptor must never
+            # receive them from the initiator.
+            if token.neg_state in (NegState.request_mic, NegState.reject):
+                raise InvalidTokenError(
+                    context_msg="SPNEGO NegTokenResp negState %s is only valid in a reply from the target"
+                    % NegState.native_labels()[token.neg_state]
+                )
+
+            # supportedMech SHALL only be present in the first reply from the target, i.e. it is only ever sent by an
+            # acceptor. An acceptor receiving one from the peer is a protocol violation.
+            if token.supported_mech:
+                raise InvalidTokenError(
+                    context_msg="SPNEGO NegTokenResp supportedMech can only be sent by the target acceptor"
+                )
+
+        else:
+            # The initiator only talks to an acceptor once it has sent its NegTokenInit. A NegTokenResp arriving
+            # before any mechanism list was established cannot be acted upon.
+            if not self._context_list:
+                raise InvalidTokenError(
+                    context_msg="Received a SPNEGO NegTokenResp before the negotiation was initiated"
+                )
+
     def _step_spnego_token(
         self,
         in_token: typing.Optional[bytes] = None,
@@ -286,7 +372,12 @@ class NegotiateProxy(ContextProxy):
         channel_bindings: typing.Optional[GssChannelBindings] = None,
     ) -> typing.Optional[bytes]:
         chosen_mech = self._chosen_mech
-        context, generated_token = self._context_list[chosen_mech]
+        try:
+            context, generated_token = self._context_list[chosen_mech]
+        except KeyError as e:
+            raise InvalidTokenError(
+                context_msg="SPNEGO token references mechanism %s which has no negotiated context" % chosen_mech
+            ) from e
 
         out_token: typing.Optional[bytes] = None
         if not context.complete:
@@ -297,7 +388,19 @@ class NegotiateProxy(ContextProxy):
                 self._context_list[chosen_mech] = (context, None)  # Clear the value as it's no longer required.
 
             else:
-                out_token = context.step(in_token=in_token, channel_bindings=channel_bindings)
+                try:
+                    out_token = context.step(in_token=in_token, channel_bindings=channel_bindings)
+                except SpnegoError:
+                    raise
+                except (struct.error, ValueError, KeyError, IndexError) as e:
+                    # The inner mechanism failed to parse the token. This can happen when a peer sends a token for the
+                    # wrong mechanism (e.g. an optimistic Kerberos AP-REQ reaching an NTLM context); surface it as an
+                    # invalid SPNEGO token rather than a mechanism specific raw exception.
+                    raise InvalidTokenError(
+                        base_error=e,
+                        context_msg="Failed to process the %s mechanism token: %s"
+                        % (chosen_mech.common_name, str(e)),
+                    ) from e
 
             # NTLM has a special case where we need to tell it it's ok to generate the MIC and also determine if
             # it actually did set the MIC as that controls the mechListMIC for the SPNEGO token.
@@ -360,9 +463,17 @@ class NegotiateProxy(ContextProxy):
 
                 self._mech_sent = True
 
+            # Completion is determined solely by the local mechanism context and the local MIC exchange state. The
+            # peer's negState is never trusted to complete the context.
             if self._context.complete and (not self._mic_required or (self._mic_sent and self._mic_recv)):
                 state = NegState.accept_complete
                 self._complete = True
+
+            # When the negotiation is complete there is nothing left to send. RFC 4178 allows returning no output
+            # token in this case and an accept-complete token carrying neither a responseToken nor a mechListMIC would
+            # just repeat the state the local side has already inferred.
+            if self._complete and out_token is None and out_mic is None and supported_mech is None:
+                return None
 
             final_token = NegTokenResp(
                 neg_state=state, supported_mech=supported_mech, response_token=out_token, mech_list_mic=out_mic

@@ -2,6 +2,13 @@
 
 ## 0.13.0 - TBD
 
+* Harden the Python managed SPNEGO (`NegotiateProxy`) acceptor and initiator against malformed or spoofed negotiation tokens per RFC 4178
+  * Context completion is now derived solely from the local mechanism context and the local `mechListMIC` exchange state; a peer claiming `negState: accept-complete` no longer completes the context while a MIC is still outstanding, so a stripped final `NegTokenResp` can no longer bypass the `request-mic` protection or downgrade Kerberos to NTLM
+  * The optimistic `mechToken` in a `NegTokenInit` is ignored when the acceptor selects a mechanism other than the initiator's preferred one; the acceptor replies with `request-mic` and no `responseToken`, and the initiator restarts the selected mechanism instead of feeding the foreign token (e.g. a Kerberos ticket) to the NTLM context
+  * Invalid peer state (`negState` outside the RFC range, `request-mic`/`reject` sent to an acceptor, `supportedMech` sent by an initiator, unknown mechanism OIDs, empty `mechTypes`) now consistently raises `InvalidTokenError` rather than leaking raw `ValueError`, `KeyError`, `IndexError`, `StopIteration` or `struct.error`
+  * Malformed inner mechanism tokens are wrapped as `InvalidTokenError` instead of propagating mechanism specific parse exceptions
+  * The Windows post `accept-complete` `mechListMIC` exchange and the existing NTLM/Kerberos flows are unchanged
+
 ## 0.12.4 - 2026-10-06
 
 * Fix SSPI acceptor with explicit `Password` or `KerberosKeytab` credentials failing with `SEC_E_LOGON_DENIED` when the username is in the UPN form `user@REALM`

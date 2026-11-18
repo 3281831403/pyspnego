@@ -489,7 +489,13 @@ class NegTokenResp:
 
         neg_state = get_sequence_value(neg_seq, 0, "NegTokenResp", "negState", unpack_asn1_enumerated)
         if neg_state is not None:
-            neg_state = NegState(neg_state)
+            try:
+                neg_state = NegState(neg_state)
+            except ValueError:
+                raise ValueError(
+                    "Invalid NegTokenResp negState value %d, must be one of %s"
+                    % (neg_state, ", ".join(str(s.value) for s in NegState))
+                )
 
         supported_mech = get_sequence_value(neg_seq, 1, "NegTokenResp", "supportedMech", unpack_asn1_object_identifier)
         response_token = get_sequence_value(neg_seq, 2, "NegTokenResp", "responseToken", unpack_asn1_octet_string)
